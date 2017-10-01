@@ -1,130 +1,163 @@
-import os
+# External
 import csv
-
-
-samples = []
-#adress_str = './data'
-with open('./data/driving_log.csv') as csvfile:
-    reader = csv.reader(csvfile)
-    for line in reader:
-        samples.append(line)
-samples.pop(0)#delete title
-
-print('Current Set Size:',len(samples))
-
-def data_merge(path,merge_set):
-    tempo_set = []
-
-    with open(path) as csvfile1:
-        reader = csv.reader(csvfile1)
-        for line in reader:
-            tempo_set.append(line)
-    print('subset',len(tempo_set))
-    tempo_set.pop(0)#delete title
-    for sample in tempo_set:
-        merge_set.append(sample)
-    print('Current Set Size:',len(merge_set))
-
-#data_merge('./bridge/driving_log.csv',samples)
-data_merge('./curve/driving_log.csv',samples)
-data_merge('./loop/driving_log.csv',samples)
-data_merge('./recover/driving_log.csv',samples)
-data_merge('./reda1/driving_log.csv',samples)
-data_merge('./heavre/driving_log.csv',samples)
-
-print('Total Set Size:', len(samples))
+import psutil
+import sys
+import numpy
+import sklearn
+import cv2
+import matplotlib
+import matplotlib.pyplot as plt
+import keras.models
 
 from sklearn.model_selection import train_test_split
-from sklearn.utils import shuffle
+from keras.layers import *
+from keras.models import load_model
 
+# Internal
+from augmentation import *
+from balance import balance_data
 
-shuffle(samples)
-train_samples, validation_samples = train_test_split(samples, test_size=0.2)
+BATCH_SIZE = 32
+RESIZED_SHAPE = (80, 160)
 
+def get_all_data(csv_loc = './driving_log.csv'):
+    to_return = []
 
+    with open(csv_loc) as csv_file:
+        reader = csv.reader(csv_file)
+        for line in reader:
+            to_return.append(line)
 
-from keras.models import Sequential
-from keras.layers import Lambda
-from keras.layers.core import Dense, Activation, Flatten, Dropout
-from keras.layers.convolutional import Convolution2D
-from keras.layers.pooling import MaxPooling2D
-from keras.layers import Cropping2D
+    return to_return
 
+def show_image(image):
+    plt.imshow(image)
+    plt.show()
 
-import cv2
-import numpy as np
+def pretrain_image_process(image_path):
+    image = cv2.imread(image_path)
+    return image
 
-
-def generator(samples, batch_size=75):
+def center_generator(samples, batch_size, perform_aug):
     num_samples = len(samples)
     while 1: # Loop forever so the generator never terminates
-        #shuffle(samples)
+        numpy.random.shuffle(samples)
         for offset in range(0, num_samples, batch_size):
             batch_samples = samples[offset:offset+batch_size]
 
             images = []
             angles = []
+            img_index = 0
+
+            # center img loc, left img loc, right img loc, steer angle, throttle, break, speed
             for batch_sample in batch_samples:
-                name = './data/IMG/'+batch_sample[0].split('/')[-1]
-                center_image = cv2.imread(name)
-                center_angle = float(batch_sample[3])
-                images.append(center_image)
-                angles.append(center_angle)
-                image_flipped = np.fliplr(center_image)
-                measurement_flipped = -center_angle
-                images.append(image_flipped)
-                angles.append(measurement_flipped)
+                image = pretrain_image_process(batch_sample[img_index])
+                angle = float(batch_sample[3])
 
+                if (image is None):
+                    continue
 
-            # trim image to only see section with road
-            X_train = np.array(images)
-            y_train = np.array(angles)
-            yield X_train, y_train
+                if (perform_aug == False) :
+                    # original image
+                    images.append(image)
+                    angles.append(angle)
+                else:
+                    image, angle = behavior_perform_aug(image, angle)
+                    images.append(image)
+                    angles.append(angle)
 
-# compile and train the model using the generator function
-train_generator = generator(train_samples, batch_size=75)
-validation_generator = generator(validation_samples, batch_size=75)
+            X_train = numpy.array(images)
+            y_train = numpy.array(angles)
+            yield sklearn.utils.shuffle(X_train, y_train)
 
-ch, row, col = 3, 160, 320  # Trimmed image format
-stride= (2,2)
+def mean_normalize(x):
+    return K.mean(x/127.5 - 1., axis=3, keepdims=True)
 
-model = Sequential()
-model.add(Lambda(lambda x: x/255.0 - 0.5,input_shape=(row, col,ch)))
-model.add(Cropping2D(cropping=((50,20), (0,0))))
-#model.add(Dropout(0.2))
+def train_get_initializer():
+    return keras.initializers.RandomNormal()
 
-model.add(Convolution2D(24, 5, 5,subsample=stride))
-model.add(Activation('relu'))
-model.add(Dropout(0.2))
+def train_get_regularizer():
+    return keras.regularizers.l2(0.)
 
-model.add(Convolution2D(36, 5, 5, subsample=stride))
-model.add(Activation('relu'))
-model.add(Dropout(0.2))
+def train_network(train_set, validation_set, image_shape, batch_size):
+    train_set_generator = center_generator(train_set, batch_size, True)
+    validation_set_generator = center_generator(validation_set, batch_size, False)
 
-model.add(Convolution2D(48, 5, 5, subsample=stride))
-model.add(Activation('relu'))
-model.add(Dropout(0.2))
+    model = keras.models.Sequential()
 
-model.add(Convolution2D(56, 3, 3))
-model.add(Activation('relu'))
-model.add(Dropout(0.2))
+    # Start of Preprocess
+    # Grayscale AND normalize
+    model.add(Lambda(mean_normalize, input_shape=image_shape, output_shape=(image_shape[0], image_shape[1], 1)))
 
-model.add(Convolution2D(64, 3, 3))
-model.add(Activation('relu'))
-#model.add(Dropout(0.4))
+    # Crop
+    crop_dimension=((65,15), (0,0))
+    model.add( Cropping2D(cropping=crop_dimension) )
 
-model.add(Flatten())
-model.add(Dense(100))
-model.add(Activation('relu'))
-model.add(Dense(50))
-model.add(Activation('relu'))
-model.add(Dense(1))
+    #end of pre process
 
-#model.load_weights('./mod17e.h5')
-model.summary()
+    # Conv section
+    model.add(Convolution2D(filters=6, kernel_size=5, strides=1, padding='valid', data_format="channels_last"))
+    model.add(MaxPooling2D(pool_size=(2, 2)))
+    model.add(Convolution2D(filters=6, kernel_size=5, strides=1, padding='valid', data_format="channels_last"))
+    model.add(MaxPooling2D(pool_size=(2, 2)))
+    model.add(Convolution2D(filters=6, kernel_size=5, strides=1, padding='valid', data_format="channels_last"))
+    model.add(MaxPooling2D(pool_size=(2, 2)))
+    # end of Conv section
 
-model.compile(loss='mse', optimizer='adam')
-model.fit_generator(train_generator, samples_per_epoch= len(train_samples), validation_data=validation_generator, nb_val_samples=len(validation_samples), nb_epoch=5)
+    # Flatten
+    model.add(keras.layers.core.Flatten())
+    # End of flatten
 
-model.save('model.h5')
-model.summary()
+    # Start of Dense section
+    model.add(keras.layers.core.Dense(160, kernel_initializer=train_get_initializer(), \
+            kernel_regularizer=train_get_regularizer()))
+    model.add(keras.layers.Activation('relu'))
+    model.add(Dropout(0.5))
+
+    model.add(keras.layers.core.Dense(80, kernel_initializer=train_get_initializer(), \
+            kernel_regularizer=train_get_regularizer()))
+    model.add(keras.layers.Activation('relu'))
+
+    model.add(keras.layers.core.Dense(30, kernel_initializer=train_get_initializer(), \
+            kernel_regularizer=train_get_regularizer()))
+    model.add(keras.layers.Activation('relu'))
+
+    model.add(keras.layers.core.Dense(10, kernel_initializer=train_get_initializer(), \
+            kernel_regularizer=train_get_regularizer()))
+    model.add(keras.layers.Activation('relu'))
+
+    model.add(keras.layers.core.Dense(1))
+    model.add(keras.layers.Activation('linear'))
+    # End of Dense section
+
+    # Loss
+    model.compile(loss='mse', optimizer='adam')
+
+    # call backs
+    filepath="model_{epoch:02d}-{val_loss:.2f}.h"
+    callbacks = [ \
+        keras.callbacks.ModelCheckpoint(filepath, monitor='val_loss', verbose=1, save_best_only=False, mode='min', period=1), \
+        keras.callbacks.EarlyStopping(monitor='val_loss', min_delta=0.001, patience=3, verbose=1, mode='min'), \
+        ]
+
+    # Training
+    model.fit_generator(train_set_generator, steps_per_epoch=int(len(train_set)), \
+            validation_data=validation_set_generator, \
+            nb_val_samples=len(validation_set), nb_epoch=1000, callbacks=callbacks)
+
+    # Conclude
+    model.save('model.h5')
+
+def main():
+    samples = get_all_data()
+    samples = balance_data(samples)
+    numpy.random.shuffle(samples)
+
+    train_samples, validation_samples = train_test_split(samples, test_size=0.05)
+    validation_samples = copy.copy(train_samples)
+
+    image_shape = numpy.shape(pretrain_image_process(train_samples[0][0]))
+    train_network(train_samples, validation_samples, image_shape, BATCH_SIZE)
+
+if __name__ == '__main__':
+    main()
